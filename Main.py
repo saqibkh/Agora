@@ -3,7 +3,10 @@ import csv
 import os
 import threading
 import requests
+import base64
 from datetime import datetime
+from werkzeug.utils import secure_filename
+from flask import send_from_directory
 import time
 
 app = Flask(__name__)
@@ -12,6 +15,9 @@ app = Flask(__name__)
 DATA_DIR = 'data'
 POSTS_FILE = os.path.join(DATA_DIR, 'posts.csv')
 COMMENTS_FILE = os.path.join(DATA_DIR, 'comments.csv')
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # --- AUTOMATIC DATABASE INITIALIZATION ---
 def init_db():
@@ -21,7 +27,7 @@ def init_db():
     if not os.path.exists(POSTS_FILE):
         with open(POSTS_FILE, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['id', 'title', 'body', 'author', 'timestamp'])
+            writer.writerow(['id', 'title', 'body', 'author', 'timestamp', 'image_path'])
             
     if not os.path.exists(COMMENTS_FILE):
         with open(COMMENTS_FILE, 'w', encoding='utf-8', newline='') as f:
@@ -37,82 +43,135 @@ def write_csv(filepath, fieldnames, data):
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writerow(data)
 
-# --- THE AI INFERENCE ENGINE ---
-def generate_ai_perspectives(post_id, post_title, post_body):
+# Add Route to Serve Images
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# Vision Analysis Function
+def analyze_image(image_path):
+    print(f"DEBUG: Moondream is analyzing the image...")
+    try:
+        with open(image_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        response = requests.post("http://localhost:11434/api/generate", json={
+            "model": "moondream",
+            # This prompt is now generic: it identifies text, objects, and context
+            "prompt": (
+                "Describe this image in high detail for a forum discussion. "
+                "Identify all primary objects, any visible text, brands, or numbers, "
+                "and the overall context or condition of what is shown. "
+                "Be objective and precise."
+            ),
+            "images": [encoded_string],
+            "stream": False
+        })
+        description = response.json().get("response", "").strip()
+        print(f"DEBUG: Vision Analysis -> {description}")
+        return description
+    except Exception as e:
+        print(f"Vision error: {e}")
+        return "No visual context available."
+
+def get_current_context(query):
+    """Fetches real-time context. Times out after 10s to prevent hangs."""
+    print(f"DEBUG: Researching '{query}' on the web...")
+    try:
+        # Focusing on Reddit results for that authentic forum feel
+        with DDGS(timeout=10) as ddgs:
+            results = [r['body'] for r in ddgs.text(f"site:reddit.com {query}", max_results=3)]
+            if not results:
+                return "No specific recent forum discussions found."
+            return "\n".join(results)
+    except Exception as e:
+        print(f"DEBUG: Search skipped: {e}")
+        return "Search unavailable. Using internal logic."
+
+def generate_ai_perspectives(post_id, post_title, post_body, image_filename=None):
+    image_description = ""
+    if image_filename:
+        full_path = os.path.join(app.config['UPLOAD_FOLDER'], image_filename)
+        image_description = analyze_image(full_path)
+        print(f"Vision Analysis: {image_description}")
+
+    # 1. Start Research
+    internet_context = get_current_context(post_title)
+
+    # 2. Define Personas with specific personality 'hooks'
     personas = [
         {
             "name": "AI_Optimist", 
-            "prompt": (
-                "You are an enthusiastic, 'treat yourself' type of forum user. "
-                "You believe in quality, growth, and the joy of upgrading your life. "
-                "Look at the user's situation and encourage them to go for the best option "
-                "that brings them happiness. Use specific examples related to their topic. "
-                "Keep it under 60 words and sound like a supportive friend."
-            )
+            "style": "supportive, enthusiastic, and focused on growth/best-case results."
         },
         {
             "name": "AI_Pessimist", 
-            "prompt": (
-                "You are a cynical, 'everything is a scam' type of forum user. "
-                "You focus on hidden costs, depreciation, and the pointlessness of vanity. "
-                "Remind the user that things break and the 'new' feeling fades. "
-                "Be realistic to a fault. Keep it under 60 words and sound grumpy but grounded."
-            )
+            "style": "cynical, value-obsessed, and focused on risks or hidden downsides."
         },
         {
             "name": "AI_Contrarian", 
-            "prompt": (
-                "You are a 'think outside the box' contrarian. "
-                "Whatever the user or the general public thinks is the 'obvious' choice, "
-                "you argue for a completely different alternative. "
-                "Challenge their assumptions and offer a perspective they haven't considered. "
-                "Keep it under 60 words and sound like a stubborn expert."
-            )
+            "style": "unconventional, challenging, and prone to arguing against the obvious 'safe' choice."
         }
     ]
 
-
-    # The default local address for Ollama
     OLLAMA_API_URL = "http://localhost:11434/api/generate"
-    # Make sure this model matches what you pulled in Ollama (e.g., llama3, mistral, etc.)
-    AI_MODEL = "llama3" 
+    AI_MODEL = "gemma4:latest" # Optimized for your 12GB VRAM
 
     for persona in personas:
-        # Build the exact prompt for the AI
-        full_prompt = f"System: {persona['prompt']}\n\nUser Title: {post_title}\nUser Post: {post_body}\n\nResponse:"
+        print(f"DEBUG: {persona['name']} is thinking...")
         
+        # 3. THE REASONING PROMPT (Agentic Instruction)
+        # We tell the AI to think before it speaks to avoid hallucinations
+        full_prompt = (
+            f"SYSTEM: You are a {persona['style']} forum user.\n"
+            f"DATA FROM THE ATTACHED IMAGE: {image_description}\n" # This is now the primary data source
+            "You are participating in a discussion on Agora.\n\n"
+            f"USER POST: {post_title} - {post_body}\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Read the 'DATA FROM THE ATTACHED IMAGE' first. This is the evidence the user is talking about.\n"
+            "2. Compare the specific GPUs shown in that data.\n"
+            "3. Respond in your personality style. If the image shows one GPU winning, acknowledge those specific numbers.\n"
+            "4. NEVER mention being an AI. Sound like a real tech enthusiast.\n\n"
+            "FINAL RESPONSE:"
+        )
+
         try:
-            # Send the request to your 3080 Ti
+            # We add a 60s timeout for the GPU inference
             response = requests.post(OLLAMA_API_URL, json={
                 "model": AI_MODEL,
                 "prompt": full_prompt,
-                "stream": False # We want the full text at once, not streamed
-            })
+                "stream": False
+            }, timeout=60)
             
             if response.status_code == 200:
                 ai_text = response.json().get("response", "").strip()
                 
-                # Save the generated AI comment to the CSV database
+                # Cleanup: If the model blurted out its internal thinking, we strip it
+                if "FINAL RESPONSE:" in ai_text:
+                    ai_text = ai_text.split("FINAL RESPONSE:")[-1].strip()
+
+                # 4. Save to Database
                 comment_id = str(int(datetime.now().timestamp() * 1000))
-                
                 new_ai_comment = {
                     'id': comment_id,
                     'post_id': post_id,
                     'author': persona['name'],
                     'body': ai_text,
-                    'score': '5', # Neutral baseline score for future DPO training
+                    'score': '5',
                     'user_type': 'ai'
                 }
                 
                 write_csv(COMMENTS_FILE, ['id', 'post_id', 'author', 'body', 'score', 'user_type'], new_ai_comment)
+                print(f"DEBUG: {persona['name']} success.")
                 
-                # Add a tiny delay so the timestamps don't overlap exactly
+                # Tiny delay to keep timestamps unique
                 time.sleep(1)
                 
         except Exception as e:
-            print(f"Failed to connect to local AI for {persona['name']}. Is Ollama running? Error: {e}")
+            print(f"DEBUG: {persona['name']} failed: {e}")
 
 # --- WEB UI ROUTES ---
+# --- FIX 1: Update index to include image_path ---
 @app.route('/')
 def index():
     raw_posts = read_csv(POSTS_FILE)
@@ -127,16 +186,26 @@ def index():
             'body': post['body'],
             'author': post['author'],
             'timestamp': post['timestamp'],
+            'image_path': post.get('image_path', ''), # Added this line
             'comments': post_comments
         }
         posts.append(post_data)
 
     return render_template('index.html', posts=posts)
 
+# --- FIX 2 & 3: Update create_post to handle files and threads ---
 @app.route('/create_post', methods=['POST'])
 def create_post():
     title = request.form.get('title')
     body = request.form.get('body')
+    
+    # Handle the image upload
+    file = request.files.get('image')
+    image_filename = ""
+    
+    if file and file.filename != '':
+        image_filename = secure_filename(file.filename)
+        file.save(os.path.join(app.config['UPLOAD_FOLDER'], image_filename))
     
     post_id = str(int(datetime.timestamp(datetime.now())))
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -146,15 +215,15 @@ def create_post():
         'title': title,
         'body': body,
         'author': 'HumanUser',
-        'timestamp': timestamp
+        'timestamp': timestamp,
+        'image_path': image_filename # Save filename to CSV
     }
     
-    # 1. Save the post
-    write_csv(POSTS_FILE, ['id', 'title', 'body', 'author', 'timestamp'], new_post)
+    # Save the post with the image_path column
+    write_csv(POSTS_FILE, ['id', 'title', 'body', 'author', 'timestamp', 'image_path'], new_post)
     
-    # 2. Trigger the AI in the background!
-    # By using a thread, the web page redirects instantly while your GPU spins up.
-    thread = threading.Thread(target=generate_ai_perspectives, args=(post_id, title, body))
+    # Pass the image_filename to the background thread
+    thread = threading.Thread(target=generate_ai_perspectives, args=(post_id, title, body, image_filename))
     thread.start()
 
     return redirect(url_for('index'))
